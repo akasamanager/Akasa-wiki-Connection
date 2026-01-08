@@ -35,6 +35,7 @@ def run_sync():
         creds_dict = json.loads(GOOGLE_JSON)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
+        # 첫 번째 시트(DataLaw로 사용 중인 시트)를 엽니다.
         sheet = client.open_by_key(SHEET_ID).get_worksheet(0)
 
         # [2] 미라해제 API 세션
@@ -49,7 +50,7 @@ def run_sync():
 
         all_rows = []
         apcontinue = ""
-        max_parts = 1 # 헤더 생성을 위해 최대 분할 수 추적
+        max_parts = 1 
         
         while True:
             params = {"action": "query", "list": "allpages", "aplimit": "20", "format": "json", "apcontinue": apcontinue}
@@ -73,15 +74,22 @@ def run_sync():
                 p_info = pages_detail.get(pid, {})
                 title = p_info.get('title', 'N/A')
                 
+                # [수정] C열: 문서 종류 (넘겨주기 여부 확인)
+                is_redirect = "넘겨주기" if "redirect" in p_info else "일반 문서"
+                
+                # [수정] D열: 분류 추출
+                categories = p_info.get('categories', [])
+                cat_names = ", ".join([c.get('title', '').replace('분류:', '') for c in categories])
+                
                 # JSON 문자열 변환
                 raw_json_str = json.dumps(p_info, indent=2, ensure_ascii=False)
                 
-                # [핵심] 데이터 분할 실행
+                # 데이터 분할
                 json_parts = split_json_data(raw_json_str, CELL_LIMIT)
                 max_parts = max(max_parts, len(json_parts))
                 
-                # 한 줄 데이터 구성: [ID, 제목, JSON_파트1, JSON_파트2, ...]
-                row = [pid, title] + json_parts
+                # [수정] 한 줄 데이터 구성: [ID, 제목, 종류, 분류, JSON_파트1, ...]
+                row = [pid, title, is_redirect, cat_names] + json_parts
                 all_rows.append(row)
 
             if 'continue' in res:
@@ -92,14 +100,14 @@ def run_sync():
         # [3] 시트 업데이트
         sheet.clear()
         
-        # 동적으로 헤더 생성 (JSON 데이터 1, JSON 데이터 2...)
-        header = ["페이지 ID", "문서 제목"] + [f"JSON 데이터 {i+1}" for i in range(max_parts)]
+        # [수정] 헤더 생성 (C, D열 추가 반영)
+        header = ["페이지 ID", "문서 제목", "문서 종류", "분류"] + [f"JSON 데이터 {i+1}" for i in range(max_parts)]
         sheet.append_row(header)
         
         if all_rows:
             sheet.append_rows(all_rows)
         
-        send_discord_bot_message(f"✅ **셀 분할 동기화 성공!**\n총 **{len(all_rows)}**개의 문서가 업데이트되었습니다.\n(최대 분할 수: {max_parts})")
+        send_discord_bot_message(f"✅ **동기화 성공! (분류/종류 추가)**\n총 **{len(all_rows)}**개의 문서가 업데이트되었습니다.")
 
     except Exception as e:
         send_discord_bot_message(f"❌ **동기화 실패**\n{str(e)}")
