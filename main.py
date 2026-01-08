@@ -28,93 +28,119 @@ def split_json_data(data_str, limit):
 
 def run_sync():
     try:
+        # [1] 구글 시트 연결
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds_dict = json.loads(GOOGLE_JSON)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SHEET_ID).get_worksheet(0)
 
+        # [2] API 세션 시작
         API_URL = "https://akasauniverse.miraheze.org/w/api.php"
         session = requests.Session()
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
+        headers = {"User-Agent": "WikiSyncBot/1.0 (Contact: KimKingGe)"}
 
-        # 위키 로그인
-        res = session.get(API_URL, params={"action":"query","meta":"tokens","type":"login","format":"json"}, headers=headers)
-        login_token = res.json()['query']['tokens']['logintoken']
-        session.post(API_URL, data={"action":"login","lgname":WIKI_USER,"lgpassword":WIKI_PASS,"lgtoken":login_token,"format":"json"}, headers=headers)
+        # 로그인 프로세스
+        res = session.get(API_URL, params={"action":"query","meta":"tokens","type":"login","format":"json"}).json()
+        login_token = res['query']['tokens']['logintoken']
+        
+        login_res = session.post(API_URL, data={
+            "action": "login",
+            "lgname": WIKI_USER,
+            "lgpassword": WIKI_PASS,
+            "lgtoken": login_token,
+            "format": "json"
+        }).json()
+
+        if login_res.get("login", {}).get("result") != "Success":
+            raise Exception(f"위키 로그인 실패: {login_res}")
 
         all_rows = []
         apcontinue = ""
         max_parts = 1 
         
+        # [수정] 무한 루프 방지 및 안정적인 네임스페이스 수집
         while True:
-            # [핵심 수정] apnamespace='*' 추가: 일반문서, 분류, 틀 등 모든 네임스페이스 포함
+            # apnamespace를 '*' 대신 '0|10|14' 처럼 주요 번호를 직접 지정하는 것이 더 안전합니다.
             params = {
                 "action": "query", 
                 "list": "allpages", 
                 "aplimit": "50", 
-                "apnamespace": "*", 
+                "apnamespace": "0|10|14", # 일반(0), 틀(10), 분류(14)
                 "format": "json", 
                 "apcontinue": apcontinue
             }
-            res = session.get(API_URL, params=params, headers=headers).json()
-            pages = res.get('query', {}).get('allpages', [])
-            page_ids = [str(p['pageid']) for p in pages]
-            if not page_ids: break
+            
+            response = session.get(API_URL, params=params).json()
+            
+            if 'error' in response:
+                raise Exception(f"API 에러 발생: {response['error']}")
+                
+            pages = response.get('query', {}).get('allpages', [])
+            
+            # 페이지를 못 가져왔을 때의 처리
+            if not pages:
+                print("더 이상 가져올 페이지가 없습니다.")
+                break
 
-            # [보강] rvprop에 contentmodel 추가하여 표/템플릿 구조 파악 용이하게 함
+            page_ids = [str(p['pageid']) for p in pages]
+
             prop_params = {
                 "action": "query",
                 "pageids": "|".join(page_ids),
                 "prop": "revisions|categories|info",
-                "rvprop": "user|content|timestamp|ids|contentmodel",
+                "rvprop": "user|content|timestamp|ids",
                 "rvslots": "main",
                 "format": "json"
             }
-            prop_res = session.get(API_URL, params=prop_params, headers=headers).json()
+            prop_res = session.get(API_URL, params=prop_params).json()
             pages_detail = prop_res.get('query', {}).get('pages', {})
 
             for pid in page_ids:
                 p_info = pages_detail.get(pid, {})
+                if not p_info or 'title' not in p_info: continue
+                
                 title = p_info.get('title', 'N/A')
                 ns = p_info.get('ns', 0)
                 
-                # 문서 종류 판별 (네임스페이스 기반)
                 kind = "일반"
                 if ns == 14: kind = "분류"
                 elif ns == 10: kind = "틀"
-                
-                if "redirect" in p_info:
-                    kind += " (넘겨주기)"
+                if "redirect" in p_info: kind += " (넘겨주기)"
                 
                 categories = p_info.get('categories', [])
                 cat_names = ", ".join([c.get('title', '').replace('분류:', '') for c in categories])
                 
-                # JSON 데이터 생성 (표 템플릿 등 모든 revisions 데이터 포함)
                 raw_json_str = json.dumps(p_info, indent=2, ensure_ascii=False)
                 json_parts = split_json_data(raw_json_str, CELL_LIMIT)
                 max_parts = max(max_parts, len(json_parts))
                 
-                row = [pid, title, kind, cat_names] + json_parts
-                all_rows.append(row)
+                all_rows.append([pid, title, kind, cat_names] + json_parts)
 
-            if 'continue' in res:
-                apcontinue = res['continue']['apcontinue']
-                time.sleep(1)
-            else: break
+            if 'continue' in response:
+                apcontinue = response['continue']['apcontinue']
+                time.sleep(0.5) # 속도 조절
+            else:
+                break
+
+        # [3] 시트 업데이트 (데이터가 있을 때만)
+        if not all_rows:
+            send_discord_bot_message("⚠️ 동기화 경고: 가져온 데이터가 0건입니다. 설정을 확인하세요.")
+            return
 
         sheet.clear()
         header = ["페이지 ID", "문서 제목", "문서 종류", "분류"] + [f"JSON 데이터 {i+1}" for i in range(max_parts)]
         sheet.append_row(header)
         
-        if all_rows:
-            # 데이터가 많을 경우를 대비해 100행씩 끊어서 입력 (안정성)
-            for k in range(0, len(all_rows), 100):
-                sheet.append_rows(all_rows[k:k+100])
+        # 50행씩 안전하게 끊어서 입력
+        for k in range(0, len(all_rows), 50):
+            sheet.append_rows(all_rows[k:k+50])
+            time.sleep(1)
         
-        send_discord_bot_message(f"✅ **전체 네임스페이스 동기화 성공!**\n총 **{len(all_rows)}**개의 문서(분류/틀 포함)가 업데이트되었습니다.")
+        send_discord_bot_message(f"✅ **동기화 성공!**\n총 **{len(all_rows)}**개 문서 완료.")
 
     except Exception as e:
+        print(f"에러 발생: {e}")
         send_discord_bot_message(f"❌ **동기화 실패**\n{str(e)}")
 
 if __name__ == "__main__":
