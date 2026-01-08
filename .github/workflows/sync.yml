@@ -2,7 +2,7 @@ name: Wiki to Google Sheets Sync
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 매일 한국 시간 오전 9시 (UTC 0시)
+    - cron: '17 0 * * *' # 오전 9시 17분 (정각을 피해서 설정)
   workflow_dispatch: # 수동 실행 버튼
 
 jobs:
